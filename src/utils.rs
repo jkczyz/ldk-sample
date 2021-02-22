@@ -16,8 +16,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::str;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::prelude::*;
 
 use time::OffsetDateTime;
 

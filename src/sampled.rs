@@ -6,7 +6,8 @@ use lightning::chain::{chaininterface, channelmonitor};
 use lightning::chain::chaininterface::{BroadcasterInterface, FeeEstimator};
 use lightning::chain::chainmonitor::ChainMonitor;
 use lightning::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateErr, MonitorEvent};
-use lightning::chain::keysinterface::InMemoryChannelKeys;
+use lightning::chain::keysinterface;
+use lightning::chain::keysinterface::InMemorySigner;
 use lightning::chain::transaction::OutPoint;
 use lightning::chain::keysinterface::KeysInterface;
 use lightning::ln::peer_handler;
@@ -22,20 +23,24 @@ use lightning::util::logger::Logger;
 use lightning_net_tokio::*;
 
 use lightning_block_sync::*;
-use lightning_block_sync::http_clients::RPCClient;
-use lightning_block_sync::http_endpoint::HttpEndpoint;
+use lightning_block_sync::init;
+use lightning_block_sync::rpc;
+use lightning_block_sync::http::HttpEndpoint;
 
 use bitcoin::{BlockHash, TxOut};
 use bitcoin::blockdata;
 use bitcoin::blockdata::block::{Block, BlockHeader};
+use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::blockdata::script::Script;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode;
 use bitcoin::hash_types::Txid;
 use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
-use bitcoin::network::constants;
+use bitcoin::network::constants::Network;
 use bitcoin::secp256k1::key::{PublicKey, SecretKey};
+
+use futures_util::future::FutureExt;
 
 use std::cmp;
 use std::collections::HashMap;
@@ -91,9 +96,8 @@ impl ChainWatchdog {
 	}
 }
 
-impl Watch for ChainWatchdog {
-	type Keys = InMemoryChannelKeys;
-	fn watch_channel(&self, funding_txo: OutPoint, monitor: ChannelMonitor<Self::Keys>) -> Result<(), ChannelMonitorUpdateErr> {
+impl<S: keysinterface::Sign> Watch<S> for ChainWatchdog {
+	fn watch_channel(&self, funding_txo: OutPoint, monitor: ChannelMonitor<S>) -> Result<(), ChannelMonitorUpdateErr> {
 		Ok(())
 	}
 	fn update_channel(&self, funding_txo: OutPoint, update: ChannelMonitorUpdate) -> Result<(), ChannelMonitorUpdateErr> {
@@ -144,19 +148,19 @@ macro_rules! flush_msg_events {
 macro_rules! to_bech_network {
 	($network: expr) => {
 		match $network {
-			constants::Network::Bitcoin => { bitcoin_bech32::constants::Network::Bitcoin },
-			constants::Network::Testnet => { bitcoin_bech32::constants::Network::Testnet },
-			constants::Network::Regtest => { bitcoin_bech32::constants::Network::Regtest }
+			Network::Bitcoin => { bitcoin_bech32::constants::Network::Bitcoin },
+			Network::Testnet => { bitcoin_bech32::constants::Network::Testnet },
+			Network::Regtest => { bitcoin_bech32::constants::Network::Regtest }
 		};
 	}
 }
 
-pub(super) async fn setup_channel_manager<F, M, T, L, K>(mut rpccmd: Receiver<Vec<u8>>, mut netmsg: Receiver<WrapperMsg>, mut blocks: Receiver<WrapperBlock>, mut outbound: OutboundChanManagerConnector, network: constants::Network, fee_est: Arc<F>, chain_monitor: Arc<M>, tx_broadcaster: Arc<T>, logger: Arc<L>, keys_manager: Arc<K>, config: UserConfig, current_blockchain_height: usize, bitcoind_client: Arc<RpcClient>) -> (JoinHandle<()>, JoinHandle<()>)
+pub(super) async fn setup_channel_manager<F, M, T, L, K>(mut rpccmd: Receiver<Vec<u8>>, mut netmsg: Receiver<WrapperMsg>, mut blocks: Receiver<WrapperBlock>, mut outbound: OutboundChanManagerConnector, network: Network, fee_est: Arc<F>, chain_monitor: Arc<M>, tx_broadcaster: Arc<T>, logger: Arc<L>, keys_manager: Arc<K>, config: UserConfig, current_blockchain_height: usize, bitcoind_client: Arc<RpcClient>) -> (JoinHandle<()>, JoinHandle<()>)
 	where F: FeeEstimator + 'static,
-	      M: chain::Watch<Keys=InMemoryChannelKeys> + 'static,
+	      M: chain::Watch<InMemorySigner> + 'static,
 	      T: BroadcasterInterface + 'static,
 	      L: Logger + 'static,
-	      K: KeysInterface<ChanKeySigner=InMemoryChannelKeys> + 'static,
+	      K: KeysInterface<Signer = InMemorySigner> + 'static,
 {
 	let channel_manager = ChannelManager::new(network, fee_est, chain_monitor, tx_broadcaster, logger, keys_manager, config.clone(), current_blockchain_height);
 	let channel_manager_rpc = Arc::new(channel_manager);
@@ -223,7 +227,7 @@ pub(super) async fn setup_channel_manager<F, M, T, L, K>(mut rpccmd: Receiver<Ve
 	});
 	let join_handle_net: JoinHandle<()> = tokio::spawn(async move {
 		loop {
-			if let Ok(wrap_msg) = netmsg.try_recv() {
+			if let Some(Some(wrap_msg)) = netmsg.recv().now_or_never() {
 				match wrap_msg.msg {
 					Msg::Open(open) => {
 						channel_manager_net.handle_open_channel(&wrap_msg.node_id, wrap_msg.features.unwrap(), &open);
@@ -309,7 +313,7 @@ pub(super) async fn setup_channel_manager<F, M, T, L, K>(mut rpccmd: Receiver<Ve
 					_ => panic!("Not coded yet!"),
 				}
 			}
-			if let Ok(wrap_block) = blocks.try_recv() {
+			if let Some(Some(wrap_block)) = blocks.recv().now_or_never() {
 				let mut txn_data = vec![];
 				for (idx, tx) in wrap_block.txdata.iter().enumerate() {
 					txn_data.push((idx, tx));
@@ -342,7 +346,7 @@ pub(super) async fn setup_chain_processing<C: Deref + Send + 'static, T: Deref +
 	      T::Target: BroadcasterInterface,
 	      F::Target: FeeEstimator,
 	      L::Target: Logger,
-	      P::Target: channelmonitor::Persist<InMemoryChannelKeys>,
+	      P::Target: channelmonitor::Persist<InMemorySigner>,
 {
 	let join_handle: JoinHandle<()> = tokio::spawn(async move {
 		let _chain_processing = ChainMonitor::new(Some(chain_source), broadcaster, logger, feeest, persister);
@@ -391,12 +395,13 @@ impl InboundRouterConnector {
 	}
 }
 
-pub(super) async fn setup_router<F: Deref + Send + 'static, L: Deref + Send + 'static>(_outbound: OutboundRouterConnector, mut inbound: InboundRouterConnector, utxo_accessor: F, logger: L) -> JoinHandle<()>
+pub(super) async fn setup_router<F: Deref + Send + 'static, L: Deref + Send + 'static>(network: Network, _outbound: OutboundRouterConnector, mut inbound: InboundRouterConnector, utxo_accessor: F, logger: L) -> JoinHandle<()>
 	where F::Target: Access,
 	      L::Target: Logger,
 {
 	let join_handle: JoinHandle<()> = tokio::spawn(async move {
-		let router = NetGraphMsgHandler::new(Some(utxo_accessor), logger);
+		let genesis_hash = genesis_block(network).block_hash();
+		let router = NetGraphMsgHandler::new(genesis_hash, Some(utxo_accessor), logger);
 		loop {
 			if let Some(buffer) = inbound.rpccmd.recv().await {
 				let v: serde_json::Value = serde_json::from_slice(&buffer[..]).unwrap();
@@ -531,7 +536,7 @@ impl ChannelMessageHandler for BufferNetMsg {
 impl MessageSendEventsProvider for BufferNetMsg {
 	fn get_and_clear_pending_msg_events(&self) -> Vec<MessageSendEvent> {
 		if let Ok(mut chanman_msg_events) = self.chanman_msg_events.lock() {
-			if let Ok(events) = chanman_msg_events.try_recv() {
+			if let Some(Some(events)) = chanman_msg_events.recv().now_or_never() {
 				return events;
 			}
 		}
@@ -556,8 +561,24 @@ impl RoutingMessageHandler for OutboundPeerManagerConnector {
 	fn get_next_node_announcements(&self, starting_point: Option<&PublicKey>, batch_amount: u8) -> Vec<NodeAnnouncement> {
 		vec![]
 	}
-	fn should_request_full_sync(&self, node_id: &PublicKey) -> bool {
-		true
+	fn sync_routing_table(&self, _their_node_id: &PublicKey, _init_msg: &Init) {}
+	fn handle_reply_channel_range(&self, _their_node_id: &PublicKey, _msg: ReplyChannelRange) -> Result<(), LightningError> {
+		Ok(())
+	}
+	fn handle_reply_short_channel_ids_end(&self, _their_node_id: &PublicKey, _msg: ReplyShortChannelIdsEnd) -> Result<(), LightningError> {
+		Ok(())
+	}
+	fn handle_query_channel_range(&self, _their_node_id: &PublicKey, _msg: QueryChannelRange) -> Result<(), LightningError> {
+		Ok(())
+	}
+	fn handle_query_short_channel_ids(&self, _their_node_id: &PublicKey, _msg: QueryShortChannelIds) -> Result<(), LightningError> {
+		Ok(())
+	}
+}
+
+impl MessageSendEventsProvider for OutboundPeerManagerConnector {
+	fn get_and_clear_pending_msg_events(&self) -> Vec<MessageSendEvent> {
+		vec![]
 	}
 }
 
@@ -596,7 +617,7 @@ pub(super) async fn setup_peer_manager<C, R, L>(outbound: Arc<OutboundPeerManage
 	});
 	let join_handle_event: JoinHandle<()> = tokio::spawn(async move { // Event processing thread
 		loop {
-			if let Ok(_) = peerman_notify.try_recv() {
+			if let Some(Some(_)) = peerman_notify.recv().now_or_never() {
 				println!("Processing event...");
 				peer_handler_event.process_events();
 			}
@@ -632,9 +653,9 @@ impl OutboundSocketListenerConnector {
 pub(super) async fn setup_socket_listener<C: ChannelMessageHandler + 'static, R: RoutingMessageHandler + 'static, L: Logger + 'static>(peer_manager_arc: Arc<peer_handler::PeerManager<SocketDescriptor, Arc<C>, Arc<R>, Arc<L>>>, outbound: OutboundSocketListenerConnector, port: u16) -> JoinHandle<()>
 {
 	let join_handle: JoinHandle<()> = tokio::spawn(async move {
-		let mut listener = tokio::net::TcpListener::bind(("::".parse::<std::net::Ipv6Addr>().unwrap(), port)).await.unwrap();
+		let mut listener = std::net::TcpListener::bind(("::".parse::<std::net::Ipv6Addr>().unwrap(), port)).unwrap();
 		loop {
-			let sock = listener.accept().await.unwrap().0;
+			let sock = listener.accept().unwrap().0;
 			let outbound_socket_events = outbound.outbound_socket_events.clone();
 			let peer_manager_listener = peer_manager_arc.clone();
 			tokio::spawn(async move {
@@ -771,7 +792,7 @@ impl ChainConnector {
 	}
 }
 
-impl ChainListener for ChainConnector {
+impl ChainListener for &ChainConnector {
 	fn block_connected(&self, block: &Block, height: u32) {
 		if let Ok(mut buffer_connect) = self.buffer_connect.lock() {
 			buffer_connect.push(WrapperBlock { header: block.header.clone(), txdata: block.txdata.clone(), height });
@@ -784,21 +805,20 @@ impl ChainListener for ChainConnector {
 	}
 }
 
-pub(super) async fn setup_chain_backend<CL>(chain_tip_hash: BlockHash, block_source: (String, String), buffer_blocks: Arc<ChainConnector>, chain_listener: Arc<CL>, mut chanman_connect: Sender<WrapperBlock>) -> (JoinHandle<()>, JoinHandle<()>)
-	where CL: ChainListener + 'static,
-{
-	let join_handle_chain: JoinHandle<()> = tokio::spawn(async move {
-		let bitcoind_endpoint = HttpEndpoint::new(&("http://".to_string() + &block_source.1 + "/")).unwrap();
-		let mut bitcoind_client = RPCClient::new(&block_source.0, bitcoind_endpoint);
-		let chain_tip = bitcoind_client.get_header(&chain_tip_hash, None).await.unwrap();
-		let block_sources = vec![&mut bitcoind_client as &mut dyn BlockSource];
-		let backup_sources = vec![];
+pub(super) async fn setup_chain_backend(chain_tip_hash: BlockHash, block_source: (String, String), buffer_blocks: Arc<ChainConnector>, network: Network, chain_listener: Arc<ChainConnector>, mut chanman_connect: Sender<WrapperBlock>) -> (JoinHandle<()>, JoinHandle<()>) {
+	let bitcoind_endpoint = HttpEndpoint::for_host(block_source.1);
+	let mut bitcoind_client = rpc::RpcClient::new(&block_source.0, bitcoind_endpoint).unwrap();
 
-		let mut client = MicroSPVClient::init(chain_tip, block_sources, backup_sources, chain_listener, false);
+	let mut header_cache = UnboundedCache::new();
+	let chain_tip = init::sync_listeners(&mut bitcoind_client, network, &mut header_cache, vec![]).await.unwrap();
+
+	let join_handle_chain: JoinHandle<()> = tokio::spawn(async move {
+		let chain_poller = poll::ChainPoller::new(&mut bitcoind_client, network);
+		let mut client = SpvClient::new(chain_tip, chain_poller, &mut header_cache, &*chain_listener);
 		let mut interval = tokio::time::interval(Duration::from_secs(1));
 		loop {
 			interval.tick().await;
-			if client.poll_best_tip().await {}
+			if client.poll_best_tip().await.unwrap().1 {}
 		}
 	});
 	let join_handle_block: JoinHandle<()> = tokio::spawn(async move {

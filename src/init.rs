@@ -163,7 +163,7 @@ async fn main() {
 		key
 	};
 	let cur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-	let keys = Arc::new(KeysManager::new(&our_node_seed, network, cur.as_secs(), cur.subsec_nanos()));
+	let keys = Arc::new(KeysManager::new(&our_node_seed, cur.as_secs(), cur.subsec_nanos()));
 
 	println!("Node Pubkey {}", PublicKey::from_secret_key(&secp_ctx, &keys.get_node_secret()));
 
@@ -188,7 +188,7 @@ async fn main() {
 	let buffer_blocks = Arc::new(ChainConnector::new());
 	let chain_listener = buffer_blocks.clone();
 
-	let (handle_1, handle_2) = setup_chain_backend(starting_blockhash.unwrap(), (ldk_config.get_str("bitcoind_credentials"), ldk_config.get_str("bitcoind_hostport")), buffer_blocks, chain_listener, outbound_blocks_chan_manager).await;
+	let (handle_1, handle_2) = setup_chain_backend(starting_blockhash.unwrap(), (ldk_config.get_str("bitcoind_credentials"), ldk_config.get_str("bitcoind_hostport")), buffer_blocks, network, chain_listener, outbound_blocks_chan_manager).await;
 	join_handles.push(handle_1);
 	join_handles.push(handle_2);
 
@@ -265,7 +265,7 @@ async fn main() {
 	let utxo_accessor = Arc::new(UtxoWatchdog::new());
 	let outbound_router_connector = OutboundRouterConnector::new(outbound_router_rpcreply);
 	let inbound_router_connector = InboundRouterConnector::new(inbound_router_rpccmd, inbound_router_rpcreply);
-	let handle = setup_router(outbound_router_connector, inbound_router_connector, utxo_accessor.clone(), logger.clone()).await;
+	let handle = setup_router(network, outbound_router_connector, inbound_router_connector, utxo_accessor.clone(), logger.clone()).await;
 	join_handles.push(handle);
 
 	// Step 9: Start a peer manager
